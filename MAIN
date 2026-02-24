@@ -1,101 +1,204 @@
 import pandas as pd
-import os
-from datetime import datetime, timedelta
-from energyquantified.time import Frequency
-from energyquantified import EnergyQuantified
+import numpy as np
+import re
+from pathlib import Path
 
-pd.set_option("display.max_rows", None)
-pd.set_option("display.max_columns", None)
-pd.set_option("display.width", 1000)
+# =============================================================================
+# 1. WCZYTANIE DANYCH
+# =============================================================================
+
 BASE_DIR = Path(__file__).resolve().parent
 
-eq = EnergyQuantified(api_key="643e8599-8989ac82-063f7750-502da7c2")
+# Wczytanie BASE
+df_BASE = pd.read_csv(BASE_DIR / "BASE_to_python.csv", encoding="UTF-8", sep=";", decimal=",")
+print("df_BASE - pierwsze wiersze:")
+print(df_BASE.head())
+print(f"Kolumny: {df_BASE.columns.tolist()}\n")
 
-# 🗓️ Zakres dat
-start_date = datetime(2026, 1, 28)
-end_date = datetime.today()  # możesz też wpisać np. datetime(2025, 2, 10)
+# Wczytanie WEEK
+df_WEEK = pd.read_csv(BASE_DIR / "WEEK_to_python.csv", encoding="UTF-8", sep=",", decimal=".")
+print("df_WEEK - pierwsze wiersze:")
+print(df_WEEK.head())
+print(f"Kolumny: {df_WEEK.columns.tolist()}\n")
 
-output_dir = r"C:\Projekt OLEK"
-output_file = os.path.join(output_dir, f"ihuefriuhvf.xlsx")
 
-dane_list = [
-"PL Price Spot Ensemble EUR/MWh H Forecast",
-"PL Price Spot EUR/MWh Power2Sim H Forecast",
-"PL Price Spot Short-term EUR/MWh H Forecast"
-]
+# =============================================================================
+# 2. PARSOWANIE DAT
+# =============================================================================
 
-all_days_df = []  # tu będziemy zbierać dane z każdego dnia
+def parse_date_col(series, col_name="kolumna"):
+    """Parsuje kolumne z datami w roznych formatach (DD.MM.YYYY, DD.MM.YY itp.)"""
+    parsed = pd.to_datetime(series, dayfirst=True, errors="coerce")
+    failed = parsed.isna().sum()
+    if failed > 0:
+        print(f"  WARNING  {col_name}: {failed} wartosci nie udalo sie sparsowac -> NaT")
+    return parsed
 
-# 🌀 Pętla po dniach
-current_date = start_date
-while current_date <= end_date:
-    base_date = current_date
-    target_date = (base_date + timedelta(days=1)).date()
 
-    print(f"\n📅 Przetwarzanie dnia: {base_date.date()} -> {target_date}")
+def parse_instrument_date(instrument: str):
+    """
+    Wyciaga date dostawy z nazwy instrumentu BASE.
+    Obsluguje formaty:
+      BASE_31-05-2017  ->  DD-MM-YYYY
+      BASE_01-06-17    ->  DD-MM-YY
+      BASE_2017-05-31  ->  YYYY-MM-DD  (na wszelki wypadek)
+    """
+    if not isinstance(instrument, str):
+        return None
 
-    combined_df = None
+    match = re.search(r"_(.+)$", instrument)
+    if not match:
+        return None
 
-    for dane in dane_list:
+    date_str = match.group(1)
+
+    for fmt in ("%d-%m-%Y", "%d-%m-%y", "%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y"):
         try:
-            forecasts = eq.instances.load(
-                dane,
-                issued_at_latest=base_date.replace(hour=0, minute=0),
-                limit=2,
-                frequency=Frequency.PT1H,
-            )
+            return pd.to_datetime(date_str, format=fmt)
+        except ValueError:
+            continue
 
-            df = forecasts.to_pandas_dataframe()
+    print(f"  WARNING  Nie rozpoznano formatu daty w instrumencie: '{instrument}'")
+    return None
 
-            if df.empty:
-                print(f"Brak danych dla: {dane} ({base_date.date()})")
-                continue
 
-            df.reset_index(inplace=True)
-            df.columns = [''.join(col) if isinstance(col, tuple) else col for col in df.columns]
+def date_to_week_label(dt) -> str:
+    """Zamienia date na etykiete tygodnia w formacie YYYY-WW (np. 2017-22)."""
+    if pd.isna(dt):
+        return None
+    iso = dt.isocalendar()
+    return f"{iso[0]}-{iso[1]:02d}"
 
-            value_col = next((col for col in df.columns if dane in col and "postfix" not in col), None)
-            if value_col is None:
-                print(f"Nie znaleziono kolumny z wartościami dla: {dane}")
-                continue
 
-            filtered_df = df[['date', value_col]].copy()
-            filtered_df.rename(columns={value_col: dane}, inplace=True)
-            filtered_df['date'] = pd.to_datetime(filtered_df['date']).dt.tz_localize(None)
-            day_df = filtered_df[filtered_df['date'].dt.date == target_date]
+# =============================================================================
+# 3. PRZETWARZANIE df_BASE
+# =============================================================================
 
-            if day_df.empty:
-                print(f"Brak danych dla: {dane} ({target_date})")
-                continue
+print("=" * 60)
+print("KROK 1: Przetwarzanie df_BASE")
+print("=" * 60)
 
-            if combined_df is None:
-                combined_df = day_df
-            else:
-                combined_df = pd.merge(combined_df, day_df, on='date', how='outer')
+df_BASE["Date"] = parse_date_col(df_BASE["Date"], "Date")
+df_BASE["delivery_date"] = df_BASE["Instrument"].apply(parse_instrument_date)
+df_BASE["delivery_week"] = df_BASE["delivery_date"].apply(date_to_week_label)
 
-            print(f"Dodano dane dla: {dane}")
+before = len(df_BASE)
+df_BASE = df_BASE.dropna(subset=["delivery_week"])
+print(f"  Usunieto {before - len(df_BASE)} wierszy bez rozpoznanej daty dostawy.")
+print(f"  Wierszy z aktywnymi transakcjami: {(df_BASE['Trades'] > 0).sum()} / {len(df_BASE)}")
 
-        except Exception as e:
-            print(f"Błąd przy przetwarzaniu {dane}: {e}")
+print("\ndf_BASE po przetworzeniu:")
+print(df_BASE[["Date", "Instrument", "delivery_date", "delivery_week", "Last", "Quantity"]].to_string(index=False))
 
-    # 🧮 Zapisz dane z danego dnia do listy
-    if combined_df is not None and not combined_df.empty:
-        combined_df.sort_values('date', inplace=True)
-        combined_df["Godzina"] = combined_df["date"].dt.hour + 1
-        combined_df["PEAK/OFFPEAK"] = combined_df["Godzina"].apply(lambda x: 1 if 9 <= x <= 20 else 0)
-        combined_df["Dzień_danych"] = target_date  # żeby wiedzieć, którego dnia dotyczy prognoza
-        combined_df["DZIEN_TYG"] = combined_df["date"].dt.dayofweek + 1
-        combined_df["WEEKEND"] = combined_df["DZIEN_TYG"].apply(lambda x: 1 if x >= 5 else 0)
 
-        all_days_df.append(combined_df)
+# =============================================================================
+# 4. PRZETWARZANIE df_WEEK
+# =============================================================================
 
-    current_date += timedelta(days=1)
+print("\n" + "=" * 60)
+print("KROK 2: Przetwarzanie df_WEEK")
+print("=" * 60)
 
-# 📊 Po zakończeniu pętli — łączymy wszystko
-if all_days_df:
-    final_df = pd.concat(all_days_df, ignore_index=True)
-    final_df.sort_values(['Dzień_danych', 'date'], inplace=True)
-    final_df.to_excel(BASE / output_file, index=False)
-    print(f"\n✅ Zapisano wszystkie dane do pliku: {output_file}")
-else:
-    print("\n⚠️ Brak danych do zapisania.")
+df_WEEK["days"] = parse_date_col(df_WEEK["days"], "days")
+
+# Dla kazdego tygodnia dostawy weź OSTATNIA cene settlement (ostatni dzien handlu)
+df_WEEK_last = (
+    df_WEEK.sort_values("days")
+    .groupby("delivery_week", as_index=False)
+    .agg(
+        last_trading_day  = ("days",       "max"),
+        last_settlement   = ("settlement", "last"),
+        avg_settlement    = ("settlement", "mean"),
+    )
+)
+
+print("\ndf_WEEK - ostatnie ceny per tydzien dostawy:")
+print(df_WEEK_last.to_string(index=False))
+
+
+# =============================================================================
+# 5. AGREGACJA df_BASE PO TYGODNIU DOSTAWY
+# =============================================================================
+
+print("\n" + "=" * 60)
+print("KROK 3: Agregacja BASE per tydzien dostawy")
+print("=" * 60)
+
+df_BASE_agg = (
+    df_BASE.sort_values("Date")
+    .groupby("delivery_week", as_index=False)
+    .agg(
+        base_trade_days       = ("Date",     "count"),
+        base_avg_last         = ("Last",     lambda x: x[x > 0].mean()   if (x > 0).any() else np.nan),
+        base_last_price       = ("Last",     lambda x: x[x > 0].iloc[-1] if (x > 0).any() else np.nan),
+        base_total_quantity   = ("Quantity", "sum"),
+        base_total_trade_val  = ("Trade",    "sum"),
+        base_first_trade_date = ("Date",     "min"),
+        base_last_trade_date  = ("Date",     "max"),
+    )
+)
+
+print("\nBASE zagregowane per tydzien dostawy:")
+print(df_BASE_agg.to_string(index=False))
+
+
+# =============================================================================
+# 6. ZLACZENIE df_BASE_agg + df_WEEK_last
+# =============================================================================
+
+print("\n" + "=" * 60)
+print("KROK 4: Laczenie BASE i WEEK")
+print("=" * 60)
+
+df_result = pd.merge(
+    df_BASE_agg,
+    df_WEEK_last,
+    on="delivery_week",
+    how="outer",          # outer = zachowaj tygodnie ktore sa tylko w jednym DF
+    indicator=True,
+)
+
+df_result["source"] = df_result["_merge"].map({
+    "both":       "BASE + WEEK",
+    "left_only":  "tylko BASE",
+    "right_only": "tylko WEEK",
+})
+df_result.drop(columns="_merge", inplace=True)
+df_result = df_result.sort_values("delivery_week").reset_index(drop=True)
+
+print("\nWYNIK KONCOWY:")
+print(df_result.to_string(index=False))
+
+
+# =============================================================================
+# 7. EKSPORT DO EXCEL
+# =============================================================================
+
+output_path = "wynik_base_week.xlsx"
+df_result.to_excel(output_path, index=False)
+print(f"\nZapisano wynik do: {output_path}")
+
+# Alternatywnie CSV:
+# df_result.to_csv("wynik_base_week.csv", index=False, sep=";", decimal=",")
+
+
+# =============================================================================
+# 8. FUNKCJA POMOCNICZA - szybkie sprawdzenie konkretnego tygodnia
+# =============================================================================
+
+def sprawdz_tydzien(delivery_week: str):
+    """Wyswietl szczegoly dla konkretnego tygodnia dostawy, np. '2018-12'."""
+    row = df_result[df_result["delivery_week"] == delivery_week]
+    if row.empty:
+        print(f"Brak danych dla tygodnia: {delivery_week}")
+        return
+    r = row.iloc[0]
+    print(f"\nTydzien dostawy: {delivery_week}")
+    print(f"   Srednia cena BASE (Last):    {r['base_avg_last']:.2f}"    if pd.notna(r.get('base_avg_last'))    else "   Srednia cena BASE:           brak")
+    print(f"   Ostatnia cena BASE (Last):   {r['base_last_price']:.2f}"  if pd.notna(r.get('base_last_price'))  else "   Ostatnia cena BASE:          brak")
+    print(f"   Laczny wolumen BASE:         {r['base_total_quantity']:.0f}" if pd.notna(r.get('base_total_quantity')) else "   Wolumen BASE:                brak")
+    print(f"   Ostatnia cena WEEK (settle): {r['last_settlement']:.2f}"  if pd.notna(r.get('last_settlement'))  else "   Cena WEEK settlement:        brak")
+    print(f"   Zrodlo danych:               {r['source']}")
+
+# Przyklad uzycia:
+sprawdz_tydzien("2013-51")
