@@ -1,0 +1,101 @@
+import pandas as pd
+import os
+from datetime import datetime, timedelta
+from energyquantified.time import Frequency
+from energyquantified import EnergyQuantified
+
+pd.set_option("display.max_rows", None)
+pd.set_option("display.max_columns", None)
+pd.set_option("display.width", 1000)
+BASE_DIR = Path(__file__).resolve().parent
+
+eq = EnergyQuantified(api_key="643e8599-8989ac82-063f7750-502da7c2")
+
+# 🗓️ Zakres dat
+start_date = datetime(2026, 1, 28)
+end_date = datetime.today()  # możesz też wpisać np. datetime(2025, 2, 10)
+
+output_dir = r"C:\Projekt OLEK"
+output_file = os.path.join(output_dir, f"ihuefriuhvf.xlsx")
+
+dane_list = [
+"PL Price Spot Ensemble EUR/MWh H Forecast",
+"PL Price Spot EUR/MWh Power2Sim H Forecast",
+"PL Price Spot Short-term EUR/MWh H Forecast"
+]
+
+all_days_df = []  # tu będziemy zbierać dane z każdego dnia
+
+# 🌀 Pętla po dniach
+current_date = start_date
+while current_date <= end_date:
+    base_date = current_date
+    target_date = (base_date + timedelta(days=1)).date()
+
+    print(f"\n📅 Przetwarzanie dnia: {base_date.date()} -> {target_date}")
+
+    combined_df = None
+
+    for dane in dane_list:
+        try:
+            forecasts = eq.instances.load(
+                dane,
+                issued_at_latest=base_date.replace(hour=0, minute=0),
+                limit=2,
+                frequency=Frequency.PT1H,
+            )
+
+            df = forecasts.to_pandas_dataframe()
+
+            if df.empty:
+                print(f"Brak danych dla: {dane} ({base_date.date()})")
+                continue
+
+            df.reset_index(inplace=True)
+            df.columns = [''.join(col) if isinstance(col, tuple) else col for col in df.columns]
+
+            value_col = next((col for col in df.columns if dane in col and "postfix" not in col), None)
+            if value_col is None:
+                print(f"Nie znaleziono kolumny z wartościami dla: {dane}")
+                continue
+
+            filtered_df = df[['date', value_col]].copy()
+            filtered_df.rename(columns={value_col: dane}, inplace=True)
+            filtered_df['date'] = pd.to_datetime(filtered_df['date']).dt.tz_localize(None)
+            day_df = filtered_df[filtered_df['date'].dt.date == target_date]
+
+            if day_df.empty:
+                print(f"Brak danych dla: {dane} ({target_date})")
+                continue
+
+            if combined_df is None:
+                combined_df = day_df
+            else:
+                combined_df = pd.merge(combined_df, day_df, on='date', how='outer')
+
+            print(f"Dodano dane dla: {dane}")
+
+        except Exception as e:
+            print(f"Błąd przy przetwarzaniu {dane}: {e}")
+
+    # 🧮 Zapisz dane z danego dnia do listy
+    if combined_df is not None and not combined_df.empty:
+        combined_df.sort_values('date', inplace=True)
+        combined_df["Godzina"] = combined_df["date"].dt.hour + 1
+        combined_df["PEAK/OFFPEAK"] = combined_df["Godzina"].apply(lambda x: 1 if 9 <= x <= 20 else 0)
+        combined_df["Dzień_danych"] = target_date  # żeby wiedzieć, którego dnia dotyczy prognoza
+        combined_df["DZIEN_TYG"] = combined_df["date"].dt.dayofweek + 1
+        combined_df["WEEKEND"] = combined_df["DZIEN_TYG"].apply(lambda x: 1 if x >= 5 else 0)
+
+        all_days_df.append(combined_df)
+
+    current_date += timedelta(days=1)
+
+# 📊 Po zakończeniu pętli — łączymy wszystko
+if all_days_df:
+    final_df = pd.concat(all_days_df, ignore_index=True)
+    final_df.sort_values(['Dzień_danych', 'date'], inplace=True)
+    final_df.to_excel(BASE / output_file, index=False)
+    print(f"\n✅ Zapisano wszystkie dane do pliku: {output_file}")
+else:
+    print("\n⚠️ Brak danych do zapisania.")
